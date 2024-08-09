@@ -5,6 +5,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import copy
+from datetime import datetime
 from typing import Any, Callable, Dict, Tuple
 
 from omegaconf import DictConfig, OmegaConf
@@ -27,6 +28,15 @@ def _instantiate_node(node: DictConfig, *args: Tuple[Any, ...]):
     """
     if _has_component(node):
         _component_ = _get_component_from_path(node.get("_component_"))
+
+        if node['_component_'].endswith("Checkpointer"):
+            _output_dir = node.get("output_dir", "")
+
+            # ddmmyyyy_hhmmss
+            now = datetime.now()
+            formatted_time = now.strftime("%d%m%Y_%H%M%S")
+            node["output_dir"] = _output_dir + formatted_time
+
         kwargs = {k: v for k, v in node.items() if k != "_component_"}
         return _create_component(_component_, args, kwargs)
     else:
