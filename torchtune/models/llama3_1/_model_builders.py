@@ -62,23 +62,24 @@ def llama3_1_70b() -> TransformerDecoder:
         rope_base=500000.0,
     )
 
-
-def llama3_tokenizer(path: str, special_tokens_path: Optional[str] = None) -> Llama3Tokenizer:
+def llama3_1_405b() -> TransformerDecoder:
     """
-    Tokenizer for Llama3 and Llama3.1.
-
-    Args:
-        path (str): path to the tokenizer
-        special_tokens_path (Optional[str]): Path to ``tokenizer.json`` from Hugging Face
-            model files that contains all registered special tokens, or a local json file 
-            structured similarly. Default is None to use the canonical Llama3 special tokens.
-    
+    Builder for creating a Llama3.1 model initialized w/ the default 405B parameter values.
     Returns:
-        Llama3Tokenizer: Instantiation of the Llama3/Llama3.1 tokenizer
+        TransformerDecoder: Instantiation of Llama3.1 405B model
     """
-    special_tokens = parse_hf_tokenizer_json(special_tokens_path) if special_tokens_path is not None else None
-    return Llama3Tokenizer(path=path, special_tokens=special_tokens)
-
+    return llama3_1(
+        vocab_size=128_256,
+        num_layers=126,
+        num_heads=128,
+        num_kv_heads=8,
+        embed_dim=16384,
+        max_seq_len=8192,
+        intermediate_dim=53248,
+        attn_dropout=0.0,
+        norm_eps=1e-5,
+        rope_base=500000.0,
+    )
 
 def lora_llama3_1_8b(
     lora_attn_modules: List[LORA_ATTN_MODULES],
@@ -86,6 +87,7 @@ def lora_llama3_1_8b(
     apply_lora_to_output: bool = False,
     lora_rank: int = 8,
     lora_alpha: float = 16,
+    use_dora: bool = False,
     quantize_base: bool = False,
 ) -> TransformerDecoder:
     """
@@ -127,6 +129,7 @@ def lora_llama3_1_8b(
         lora_rank=lora_rank,
         lora_alpha=lora_alpha,
         lora_dropout=0.05,
+        use_dora=use_dora,
         quantize_base=quantize_base,
     )
 
@@ -137,6 +140,7 @@ def lora_llama3_1_70b(
     apply_lora_to_output: bool = False,
     lora_rank: int = 8,
     lora_alpha: float = 16,
+    use_dora: bool = False,
     quantize_base: bool = False,
 ) -> TransformerDecoder:
     """
@@ -178,6 +182,7 @@ def lora_llama3_1_70b(
         lora_rank=lora_rank,
         lora_alpha=lora_alpha,
         lora_dropout=0.05,
+        use_dora=use_dora,
         quantize_base=quantize_base,
     )
 

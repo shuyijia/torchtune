@@ -8,13 +8,13 @@
 import logging
 import os
 from itertools import chain
-from typing import Any, Callable, cast, Dict, Set, Tuple, Type
+from typing import Any, Callable, cast, Dict, List, Set, Tuple, Type
 
 import torch
 import torch.distributed as dist
-from packaging import version
 from torch import nn
 
+from torch.distributed._composable.fsdp import CPUOffloadPolicy, fully_shard
 from torch.distributed._tensor import distribute_tensor, DTensor
 from torch.distributed._tensor.placement_types import DTensorSpec, TensorMeta
 from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import (
@@ -25,12 +25,9 @@ from torch.distributed.fsdp import ShardingStrategy
 from torch.distributed.fsdp.wrap import ModuleWrapPolicy
 from torch.optim import Optimizer
 from torchao.dtypes.nf4tensor import NF4Tensor, to_nf4
-from torchtune import modules
-from torchtune.modules.peft.lora import (
-    _lora_a_init_params,
-    _lora_b_init_params,
-    LoRALinear,
-)
+from torchtune.modules import TransformerDecoder
+from torchtune.modules.peft import DoRALinear, LoRALinear
+from torchtune.modules.peft.lora import _lora_a_init_params, _lora_b_init_params
 
 from torchtune.utils._device import get_device
 from torchtune.utils.logging import get_logger
@@ -100,7 +97,7 @@ def _broadcast_tensor(tensor: torch.Tensor, src: int = 0) -> torch.Tensor:
     """Broadcasts a tensor from a source to all other processes.
 
     Args:
-        tensor (torch.Tensor): Tensor to broadcast.
+        tensor (torch.Tensor): torch.Tensor to broadcast.
         src (int, optional): Source rank. Defaults to 0.
 
     Returns:
@@ -120,7 +117,7 @@ def init_distributed(**kwargs: Dict[str, Any]) -> bool:
     """Initialize process group required for ``torch.distributed``.
 
     Args:
-        **kwargs (Dict): Additional arguments to pass to torch.distributed.init_process_group.
+        **kwargs (Dict[str, Any]): Additional arguments to pass to torch.distributed.init_process_group.
 
     Returns:
         bool: True if torch.distributed is initialized.
@@ -238,7 +235,7 @@ def prepare_model_for_fsdp_with_meta_device(model: nn.Module) -> nn.Module:
 
         # This will define reset_parameters for LoRA weight initialization
         # directly on any LoRALinear submodules lora_a and lora_b.
-        if isinstance(v, LoRALinear):
+        if isinstance(v, LoRALinear) or isinstance(v, DoRALinear):
             v.lora_a.reset_parameters = _lora_a_init_params.__get__(v.lora_a)
             v.lora_b.reset_parameters = _lora_b_init_params.__get__(v.lora_b)
 
@@ -253,12 +250,10 @@ def lora_fsdp_wrap_policy(modules_to_wrap: Set[Type]) -> FSDPPolicyType:
     This means that if any parameter in a given FSDP-wrapped module requires gradients, then memory will be
     allocated for gradients for the entire module.
 
-    In the case of LoRA, where only LoRA A and B matrices are trainable, this means that
-    we need to wrap LoRA A and B submodules in their own FSDP units to
+    In the case of LoRA, where only the adapters are trainable, this means that
+    we need to wrap the adapter submodules in their own FSDP units to
     maximize memory savings. After this is done, model will also be hierarchically wrapped
-    based on nn.Module types specified in ``modules_to_wrap``. This function assumes that
-    (a) LoRA's A and B matrices are the only trainable weights in the entire model, and
-    (b) we have already set ``requires_grad = True`` on LoRA params.
+    based on nn.Module types specified in ``modules_to_wrap``.
 
     Args:
         modules_to_wrap (Set[Type]): nn.Module types to recursively wrap
@@ -289,6 +284,7 @@ def load_from_full_model_state_dict(
     full_sd: Dict[str, Any],
     device: torch.device,
     is_rank_zero: bool,
+    strict: bool = False,
 ):
     """
     Converting full state dict into a sharded state dict
@@ -320,32 +316,21 @@ def load_from_full_model_state_dict(
             chunk = list(torch.chunk(full_tensor, shard_world_size, dim=0))[shard_rank]
             sharded_param = full_tensor.new_zeros(chunk.size())
             sharded_param[: chunk.size(0)].copy_(chunk)
-            # BC-breaking change to DTensor API in https://github.com/pytorch/pytorch/pull/128112
+
             # TODO: change to from_local API (need to add view support for NF4)
-            if version.parse(torch.__version__) >= version.parse("2.4.0.dev20240606"):
-                sharded_tensor = DTensor(
-                    local_tensor=sharded_param,
-                    spec=DTensorSpec(
-                        mesh=sharded_meta_param.device_mesh,
-                        placements=sharded_meta_param.placements,
-                        tensor_meta=TensorMeta(
-                            shape=sharded_meta_param.size(),
-                            dtype=sharded_meta_param.dtype,
-                            stride=sharded_meta_param.stride(),
-                        ),
+            sharded_tensor = DTensor(
+                local_tensor=sharded_param,
+                spec=DTensorSpec(
+                    mesh=sharded_meta_param.device_mesh,
+                    placements=sharded_meta_param.placements,
+                    tensor_meta=TensorMeta(
+                        shape=sharded_meta_param.size(),
+                        dtype=sharded_meta_param.dtype,
+                        stride=sharded_meta_param.stride(),
                     ),
-                    requires_grad=sharded_meta_param.requires_grad,
-                )
-            else:
-                sharded_tensor = DTensor(
-                    sharded_param,
-                    sharded_meta_param.device_mesh,
-                    sharded_meta_param.placements,
-                    shape=sharded_meta_param.size(),
-                    dtype=sharded_meta_param.dtype,
-                    requires_grad=sharded_meta_param.requires_grad,
-                    stride=sharded_meta_param.stride(),
-                )
+                ),
+                requires_grad=sharded_meta_param.requires_grad,
+            )
 
         else:
             sharded_tensor = distribute_tensor(
@@ -355,7 +340,7 @@ def load_from_full_model_state_dict(
             )
         sharded_sd[param_name] = nn.Parameter(sharded_tensor)
     # choose `assign=True` since we cannot call `copy_` on meta tensor
-    return model.load_state_dict(sharded_sd, strict=False, assign=True)
+    return model.load_state_dict(sharded_sd, strict=strict, assign=True)
 
 
 def get_full_model_state_dict(
@@ -548,7 +533,7 @@ def _memory_efficient_wrap_policy(modules_to_wrap: Set[Type]) -> FSDPPolicyType:
 
     def llama3_wrap(module: nn.Module, recurse: bool, **kwargs):
         # Label that output_proj should be wrapped individually.
-        if isinstance(module, modules.TransformerDecoder):
+        if isinstance(module, TransformerDecoder):
             module.output._wrap = True
         if recurse:
             return True
@@ -560,3 +545,43 @@ def _memory_efficient_wrap_policy(modules_to_wrap: Set[Type]) -> FSDPPolicyType:
         return isinstance(module, tuple(modules_to_wrap))
 
     return llama3_wrap
+
+
+def shard_model(
+    model: TransformerDecoder,
+    shard_conditions: List[Callable[[str, nn.Module], bool]],
+    *,
+    cpu_offload: bool,
+    reshard_after_forward: bool = True,
+) -> None:
+    """
+    Utility to shard a model with FSDP using the PyTorch Distributed fully_shard API.
+
+    This method will over the model's named modules from the bottom-up and apply shard modules
+    based on whether they meet any of the criteria from shard_conditions.
+
+    Args:
+        model (TransformerDecoder): Model to shard with FSDP.
+        shard_conditions (List[Callable[[str, nn.Module], bool]]): A list of functions to determine
+            which modules to shard with FSDP. Each function should take module name (relative to root)
+            and the module itself, returning True if FSDP should shard the module and False otherwise.
+            If any of shard_conditions return True for a given module, it will be sharded by FSDP.
+        cpu_offload (bool): If set to True, FSDP will offload parameters, gradients, and optimizer
+            states to CPU.
+        reshard_after_forward (bool): Whether to reshard parameters and buffers after
+            the forward pass. Setting this to True corresponds to the FULL_SHARD sharding strategy
+            from FSDP1, while setting it to False corresponds to the SHARD_GRAD_OP sharding strategy.
+
+    """
+    fsdp_kwargs = {"reshard_after_forward": reshard_after_forward}
+    if cpu_offload:
+        fsdp_kwargs["offload_policy"] = CPUOffloadPolicy()
+
+    # Shard the model with FSDP, iterating in reverse to start with
+    # lowest-level modules first
+    for n, m in reversed(list(model.named_modules())):
+        if any([shard_condition(n, m) for shard_condition in shard_conditions]):
+            fully_shard(m, **fsdp_kwargs)
+
+    # Finally shard the entire model to account for any stragglers
+    fully_shard(model)
